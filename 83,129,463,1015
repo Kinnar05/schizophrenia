@@ -1,0 +1,524 @@
+"""
+Reproduces Table 1 (GCN) and Table 2 (Logistic Regression) from:
+"Decision Voting Based Multiscale Convolutional Learning of Brain Networks
+ With Explainability" – Ghosh & Ghosh, bioRxiv 2025.10.29.685275
+
+Extended to ALL FIVE atlas scales: 83, 129, 234, 463, 1015
+
+FIX: NaN/Inf values in raw FC matrices are replaced with 0 before
+     graph diffusion so that scipy.linalg.eigh never sees non-finite input.
+"""
+
+# ═══════════ IMPORTS ════════════════════════════════════════════════
+import h5py, warnings, numpy as np, pandas as pd, torch, torch.nn as nn
+import torch.nn.functional as F, scipy.linalg as la
+
+from torch_geometric.nn     import ChebConv, global_mean_pool
+from torch_geometric.data   import Data
+from torch_geometric.loader import DataLoader
+
+from sklearn.model_selection  import StratifiedKFold
+from sklearn.linear_model     import LogisticRegression
+from sklearn.preprocessing    import StandardScaler
+from sklearn.metrics import (
+    accuracy_score, f1_score, roc_auc_score,
+    matthews_corrcoef, recall_score,
+    fowlkes_mallows_score, confusion_matrix,
+)
+
+warnings.filterwarnings("ignore")
+
+# ═══════════ HYPERPARAMETERS ════════════════════════════════════════
+FILE_PATH    = "/kaggle/input/datasets/kinnarhalder/schrinzophenia/27_SCHZ_CTRL_dataset(1).mat"
+N_SUBJECTS   = 54
+N_FOLDS      = 5
+
+SCALES_ROI   = [83, 129, 234, 463, 1015]
+N_SCALES     = len(SCALES_ROI)
+
+# Preprocessing
+T_DIFFUSION  = 1.0
+BETA         = 0.5
+M_SPARSE     = 10
+SC_PCT       = 50
+SIGMA_NOISE  = 2.0
+N_AUGMENTS   = 9          # +1 original = 10x
+
+# Model
+K_CHEB       = 3
+HIDDEN       = 64
+DROPOUT      = 0.5
+
+# Optimisation
+LR           = 0.01
+WEIGHT_DECAY = 1e-4
+BATCH_SIZE   = 32
+EPOCHS       = 150
+
+SEED         = 42
+DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+print(f"Device : {DEVICE}")
+print(f"Scales : {SCALES_ROI}  |  K={K_CHEB}  |  M={M_SPARSE}  |  "
+      f"t={T_DIFFUSION}  |  beta={BETA}  |  sigma={SIGMA_NOISE}  |  "
+      f"aug x{N_AUGMENTS+1}  |  epochs={EPOCHS}\n")
+
+
+# ===================================================================
+# 1.  DATA LOADING
+# ===================================================================
+
+def _to_subject_first(arr):
+    """Ensure shape is (n_subjects, N, N)."""
+    if arr.ndim == 3:
+        if arr.shape[0] == N_SUBJECTS // 2:
+            return arr
+        if arr.shape[2] == N_SUBJECTS // 2:
+            return arr.transpose(2, 0, 1)
+    return arr
+
+
+def _clean(mat):
+    """Replace NaN / +/-Inf with 0.0 and return."""
+    return np.nan_to_num(mat, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def load_data(path):
+    """
+    Returns
+    -------
+    fc : dict {scale_idx: ndarray (54, N, N)}
+    sc : dict {scale_idx: ndarray (54, N, N)}
+    y  : ndarray (54,)  labels  0=ctrl, 1=schz
+    """
+    fc, sc = {}, {}
+    with h5py.File(path, "r") as f:
+        fc_c_refs = f["SC_FC_Connectomes/FC_correlation/ctrl"]
+        fc_s_refs = f["SC_FC_Connectomes/FC_correlation/schz"]
+        sc_c_refs = f["SC_FC_Connectomes/SC_number_of_fibers/ctrl"]
+        sc_s_refs = f["SC_FC_Connectomes/SC_number_of_fibers/schz"]
+
+        for si in range(N_SCALES):
+            fc_c = _clean(_to_subject_first(
+                f[fc_c_refs[si, 0]][:]).astype(np.float64))
+            fc_s = _clean(_to_subject_first(
+                f[fc_s_refs[si, 0]][:]).astype(np.float64))
+            sc_c = _clean(_to_subject_first(
+                f[sc_c_refs[si, 0]][:]).astype(np.float64))
+            sc_s = _clean(_to_subject_first(
+                f[sc_s_refs[si, 0]][:]).astype(np.float64))
+            fc[si] = np.concatenate([fc_c, fc_s], axis=0)
+            sc[si] = np.concatenate([sc_c, sc_s], axis=0)
+
+    labels = np.array([0]*27 + [1]*27, dtype=np.int64)
+    for si, n in enumerate(SCALES_ROI):
+        print(f"  Scale {n:5d} ROIs :  FC {fc[si].shape}  SC {sc[si].shape}")
+    return fc, sc, labels
+
+
+# ===================================================================
+# 2.  PREPROCESSING
+# ===================================================================
+
+def graph_diffusion(fc, t=T_DIFFUSION, beta=BETA):
+    """
+    Eq. 1-2:  G_diff = U exp(-t*Lambda) U^T
+              G_final = beta*G_orig + (1-beta)*G_diff
+    NaN/Inf safety applied at every step.
+    """
+    A = (fc + fc.T) / 2.0
+    np.fill_diagonal(A, 0.0)
+    A = _clean(A)                                   # safety clean
+    D = np.diag(np.abs(A).sum(axis=1))
+    L = D - A
+    try:
+        eigval, eigvec = la.eigh(L)
+        eigval   = np.maximum(eigval, 0.0)
+        exp_diag = np.exp(-t * np.clip(eigval, 0.0, 500.0))  # prevent overflow
+        G_diff   = eigvec @ np.diag(exp_diag) @ eigvec.T
+        G_diff   = _clean(G_diff)
+    except la.LinAlgError:
+        G_diff = A
+    result = beta * A + (1.0 - beta) * G_diff
+    return _clean(result)
+
+
+def sparsify_fc(fc, M=M_SPARSE):
+    """Retain top-M positive + bottom-M negative correlations per node."""
+    N      = fc.shape[0]
+    sparse = np.zeros_like(fc)
+    for i in range(N):
+        row    = fc[i].copy()
+        row[i] = 0.0
+        p_idx  = np.argsort(row)[-M:]
+        n_idx  = np.argsort(row)[:M]
+        sparse[i, p_idx] = row[p_idx]
+        sparse[i, n_idx] = row[n_idx]
+    return (sparse + sparse.T) / 2.0
+
+
+def sparsify_sc(sc, pct=SC_PCT):
+    """Drop SC edges below the given percentile of non-zero values."""
+    vals = sc[sc > 0]
+    if len(vals) == 0:
+        return sc
+    thr        = np.percentile(vals, pct)
+    out        = sc.copy()
+    out[out < thr] = 0.0
+    return out
+
+
+def augment_fc(fc, sigma=SIGMA_NOISE, n=N_AUGMENTS):
+    """
+    Eq. 3:  F' = F + sigma*(p + p^T)/2,  p ~ N(0,1)
+    Returns [original] + n augmented copies.
+    """
+    copies = [fc]
+    N = fc.shape[0]
+    for _ in range(n):
+        p = np.random.randn(N, N)
+        copies.append(fc + sigma * (p + p.T) / 2.0)
+    return copies
+
+
+def preprocess_subject(fc_raw, sc_raw):
+    """Clean -> graph diffusion -> sparsification."""
+    fc_raw = _clean(fc_raw.copy())
+    sc_raw = _clean(sc_raw.copy())
+    fc = graph_diffusion(fc_raw)
+    fc = sparsify_fc(fc)
+    sc = sparsify_sc(sc_raw)
+    return fc, sc
+
+
+# ===================================================================
+# 3.  GRAPH CONSTRUCTION
+# ===================================================================
+
+def make_graph(fc, sc, label):
+    """Nodes = FC rows; edges = non-zero SC entries."""
+    x          = torch.tensor(fc, dtype=torch.float32)
+    sc_sym     = (sc + sc.T) / 2.0
+    np.fill_diagonal(sc_sym, 0.0)
+    rows, cols = np.where(sc_sym != 0.0)
+    ei         = torch.tensor(np.stack([rows, cols]), dtype=torch.long)
+    ew         = torch.tensor(sc_sym[rows, cols],     dtype=torch.float32)
+    y          = torch.tensor([label],                dtype=torch.long)
+    d          = Data(x=x, edge_index=ei, edge_attr=ew, y=y)
+    d.num_nodes = fc.shape[0]
+    return d
+
+
+def build_split_datasets(fc_scales, sc_scales, labels, train_idx, test_idx,
+                          augment_train: bool):
+    """
+    Build per-scale graph lists for one CV fold.
+    augment_train=True  -> 10x training set  (multi-scale DV-GCN)
+    augment_train=False -> original only      (single-scale baselines)
+    """
+    train_ds = {si: [] for si in range(N_SCALES)}
+    test_ds  = {si: [] for si in range(N_SCALES)}
+
+    for si in range(N_SCALES):
+        for idx in train_idx:
+            fc, sc = preprocess_subject(fc_scales[si][idx], sc_scales[si][idx])
+            copies  = augment_fc(fc) if augment_train else [fc]
+            for fc_v in copies:
+                train_ds[si].append(make_graph(fc_v, sc, labels[idx]))
+
+        for idx in test_idx:
+            fc, sc = preprocess_subject(fc_scales[si][idx], sc_scales[si][idx])
+            test_ds[si].append(make_graph(fc, sc, labels[idx]))
+
+    return train_ds, test_ds
+
+
+# ===================================================================
+# 4.  SPECTRAL GCN MODEL
+# ===================================================================
+
+class SpectralGCN(nn.Module):
+    """Two ChebConv layers -> global_mean_pool -> FC -> log_softmax."""
+    def __init__(self, in_ch, hidden=HIDDEN, K=K_CHEB, drop=DROPOUT):
+        super().__init__()
+        self.conv1 = ChebConv(in_ch, hidden, K=K)
+        self.conv2 = ChebConv(hidden, hidden, K=K)
+        self.fc    = nn.Linear(hidden, 2)
+        self.drop  = drop
+
+    def forward(self, x, edge_index, edge_weight, batch):
+        x = F.relu(self.conv1(x, edge_index, edge_weight))
+        x = F.dropout(x, p=self.drop, training=self.training)
+        x = F.relu(self.conv2(x, edge_index, edge_weight))
+        x = F.dropout(x, p=self.drop, training=self.training)
+        x = global_mean_pool(x, batch)
+        return F.log_softmax(self.fc(x), dim=1)
+
+
+# ===================================================================
+# 5.  TRAINING & EVALUATION HELPERS
+# ===================================================================
+
+def train_one_epoch(model, loader, optimiser):
+    model.train()
+    for data in loader:
+        data = data.to(DEVICE)
+        optimiser.zero_grad()
+        out  = model(data.x, data.edge_index, data.edge_attr, data.batch)
+        F.nll_loss(out, data.y.squeeze()).backward()
+        optimiser.step()
+
+
+@torch.no_grad()
+def get_predictions(model, loader):
+    model.eval()
+    preds, probs, trues = [], [], []
+    for data in loader:
+        data = data.to(DEVICE)
+        out  = model(data.x, data.edge_index, data.edge_attr, data.batch)
+        preds.extend(out.argmax(1).cpu().numpy())
+        probs.extend(torch.exp(out)[:, 1].cpu().numpy())
+        trues.extend(data.y.squeeze().cpu().numpy())
+    return np.array(preds), np.array(probs), np.array(trues)
+
+
+def compute_metrics(y_true, y_pred, y_prob):
+    acc  = accuracy_score(y_true, y_pred)
+    f1   = f1_score(y_true, y_pred, zero_division=0)
+    try:
+        auc = roc_auc_score(y_true, y_prob)
+    except Exception:
+        auc = 0.5
+    mcc  = matthews_corrcoef(y_true, y_pred)
+    rec  = recall_score(y_true, y_pred, zero_division=0)
+    cm   = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+    spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    npv  = tn / (tn + fn) if (tn + fn) > 0 else 0.0
+    fm   = fowlkes_mallows_score(y_true, y_pred)
+    return dict(accuracy=acc, f1=f1, roc_auc=auc, mcc=mcc,
+                recall=rec, specificity=spec, fm=fm, npv=npv)
+
+
+def train_gcn(train_data, test_data, in_channels, epochs=EPOCHS, verbose=True):
+    """Train a single SpectralGCN independently."""
+    loader_tr = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True)
+    loader_te = DataLoader(test_data,  batch_size=len(test_data), shuffle=False)
+
+    model = SpectralGCN(in_channels).to(DEVICE)
+    opt   = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+
+    for ep in range(epochs):
+        train_one_epoch(model, loader_tr, opt)
+        sched.step()
+
+    y_pred, y_prob, y_true = get_predictions(model, loader_te)
+    met = compute_metrics(y_true, y_pred, y_prob)
+    if verbose:
+        print(f"      acc={met['accuracy']:.4f}  f1={met['f1']:.4f}  "
+              f"auc={met['roc_auc']:.4f}  mcc={met['mcc']:.4f}")
+    return met, model
+
+
+# ===================================================================
+# 6.  MULTI-SCALE DECISION VOTING GCN  (all 5 scales)
+# ===================================================================
+
+def run_multiscale_dv_gcn(train_ds, test_ds, in_channels_list):
+    """
+    Train 5 SpectralGCN models independently (one per scale) on
+    augmented training data.  Average P(schz) across all 5 models
+    (equal-weight soft decision voting).
+    """
+    all_probs = []
+    y_true    = None
+
+    for si, ic in enumerate(in_channels_list):
+        print(f"    [DV-GCN] scale {SCALES_ROI[si]:5d} ...", end="  ")
+        loader_te = DataLoader(test_ds[si],
+                               batch_size=len(test_ds[si]), shuffle=False)
+        met, model = train_gcn(train_ds[si], test_ds[si], ic, verbose=False)
+
+        _, probs, trues = get_predictions(model, loader_te)
+        all_probs.append(probs)
+        if y_true is None:
+            y_true = trues
+        print(f"acc={met['accuracy']:.4f}")
+
+    # Equal-weight soft decision voting across all 5 scales
+    avg_probs = np.mean(all_probs, axis=0)
+    avg_preds = (avg_probs >= 0.5).astype(int)
+    return compute_metrics(y_true, avg_preds, avg_probs)
+
+
+# ===================================================================
+# 7.  LOGISTIC REGRESSION BASELINE
+# ===================================================================
+
+def fc_upper_tri_features(fc_scales, sc_scales, scale_idxs, subj_idxs):
+    """Flatten upper triangle of preprocessed FC -> feature vector."""
+    blocks = []
+    for si in scale_idxs:
+        rows = []
+        for s in subj_idxs:
+            fc, _ = preprocess_subject(fc_scales[si][s], sc_scales[si][s])
+            N = fc.shape[0]
+            rows.append(fc[np.triu_indices(N, k=1)])
+        blocks.append(np.array(rows))
+    return np.concatenate(blocks, axis=1)
+
+
+def run_logistic(fc_scales, sc_scales, labels, scale_idxs, train_idx, test_idx):
+    X_tr = fc_upper_tri_features(fc_scales, sc_scales, scale_idxs, train_idx)
+    X_te = fc_upper_tri_features(fc_scales, sc_scales, scale_idxs, test_idx)
+    y_tr, y_te = labels[train_idx], labels[test_idx]
+
+    scaler = StandardScaler()
+    X_tr   = scaler.fit_transform(X_tr)
+    X_te   = scaler.transform(X_te)
+
+    clf = LogisticRegression(max_iter=3000, C=1.0, solver="lbfgs",
+                             random_state=SEED)
+    clf.fit(X_tr, y_tr)
+
+    y_pred = clf.predict(X_te)
+    y_prob = clf.predict_proba(X_te)[:, 1]
+    return compute_metrics(y_te, y_pred, y_prob)
+
+
+# ===================================================================
+# 8.  CROSS-VALIDATION  +  TABLE GENERATION
+# ===================================================================
+
+def aggregate(fold_results):
+    keys = fold_results[0].keys()
+    return {k: (np.mean([m[k] for m in fold_results]),
+                np.std( [m[k] for m in fold_results]))
+            for k in keys}
+
+
+def fmt(mu, sd):
+    return f"{mu:.4f} +/- {sd:.4f}"
+
+
+SCALE_LABELS = {si: f"{n}x{n}" for si, n in enumerate(SCALES_ROI)}
+MULTI_LABEL  = ", ".join(f"{n}x{n}" for n in SCALES_ROI)
+
+
+def print_table(title, rows_data):
+    COLS = ["Accuracy", "F1", "ROC AUC", "MCC",
+            "Recall", "Specificity", "Fowlkes-Mallows", "NPV"]
+    KEYS = ["accuracy", "f1", "roc_auc", "mcc",
+            "recall",   "specificity",   "fm",            "npv"]
+
+    df_rows = []
+    for modality, scales_str, agg in rows_data:
+        row = {"Modality": modality, "Scales": scales_str}
+        for col, key in zip(COLS, KEYS):
+            row[col] = fmt(*agg[key])
+        df_rows.append(row)
+
+    df  = pd.DataFrame(df_rows)
+    sep = "=" * 210
+    print(f"\n{sep}")
+    print(title)
+    print(sep)
+    print(df.to_string(index=False))
+    return df
+
+
+def main():
+    # ── 1. Load ──────────────────────────────────────────────────
+    print("Loading data ...")
+    fc_scales, sc_scales, labels = load_data(FILE_PATH)
+    in_ch = SCALES_ROI          # node feature dim == number of ROIs
+
+    skf    = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    splits = list(skf.split(np.zeros(N_SUBJECTS), labels))
+
+    scale_keys = [str(s) for s in SCALES_ROI] + ["multi"]
+    gcn_res = {k: [] for k in scale_keys}
+    lr_res  = {k: [] for k in scale_keys}
+
+    # ── 2. 5-Fold CV ─────────────────────────────────────────────
+    for fold, (tr_idx, te_idx) in enumerate(splits):
+        print(f"\n{'='*70}")
+        print(f"  FOLD {fold+1}/{N_FOLDS}   "
+              f"(train={len(tr_idx)}, test={len(te_idx)})")
+        print(f"{'='*70}")
+
+        # Single-scale: NO augmentation
+        print("  Building single-scale datasets (no augmentation) ...")
+        single_tr, single_te = build_split_datasets(
+            fc_scales, sc_scales, labels, tr_idx, te_idx,
+            augment_train=False)
+
+        # Multi-scale: WITH 10x augmentation
+        print("  Building multi-scale datasets (10x augmentation) ...")
+        multi_tr, multi_te = build_split_datasets(
+            fc_scales, sc_scales, labels, tr_idx, te_idx,
+            augment_train=True)
+
+        print(f"  Single-scale train size : {len(single_tr[0])}  (x1)")
+        print(f"  Multi-scale  train size : {len(multi_tr[0])}  (x{N_AUGMENTS+1})\n")
+
+        # ── Single-scale GCN ─────────────────────────────────────
+        for si, skey in enumerate([str(s) for s in SCALES_ROI]):
+            print(f"  GCN single-scale {SCALES_ROI[si]}x{SCALES_ROI[si]} ...")
+            met, _ = train_gcn(single_tr[si], single_te[si], in_ch[si])
+            gcn_res[skey].append(met)
+
+        # ── Multi-scale DV-GCN (all 5 scales) ────────────────────
+        print("  GCN multi-scale Decision Voting (DV-GCN, 5 scales) ...")
+        met = run_multiscale_dv_gcn(multi_tr, multi_te, in_ch)
+        gcn_res["multi"].append(met)
+        print(f"    -> DV-GCN  acc={met['accuracy']:.4f}  "
+              f"f1={met['f1']:.4f}  auc={met['roc_auc']:.4f}  "
+              f"mcc={met['mcc']:.4f}")
+
+        # ── Logistic Regression ───────────────────────────────────
+        for si, skey in enumerate([str(s) for s in SCALES_ROI]):
+            met = run_logistic(fc_scales, sc_scales, labels,
+                               [si], tr_idx, te_idx)
+            lr_res[skey].append(met)
+        # Multi-scale LR: concatenate all 5 scales
+        met = run_logistic(fc_scales, sc_scales, labels,
+                           list(range(N_SCALES)), tr_idx, te_idx)
+        lr_res["multi"].append(met)
+        print("  LR done.")
+
+    # ── 3. Print Tables ───────────────────────────────────────────
+    gcn_rows = []
+    for si, skey in enumerate([str(s) for s in SCALES_ROI]):
+        gcn_rows.append(
+            ("Single", SCALE_LABELS[si], aggregate(gcn_res[skey])))
+    gcn_rows.append(
+        ("Multi (Proposed)", MULTI_LABEL, aggregate(gcn_res["multi"])))
+
+    lr_rows = []
+    for si, skey in enumerate([str(s) for s in SCALES_ROI]):
+        lr_rows.append(
+            ("Single", SCALE_LABELS[si], aggregate(lr_res[skey])))
+    lr_rows.append(
+        ("Multi (Proposed)", MULTI_LABEL, aggregate(lr_res["multi"])))
+
+    df1 = print_table(
+        "TABLE I  -- GCN: SINGLE-SCALE vs MULTI-SCALE "
+        "(5 Scales: 83, 129, 234, 463, 1015)",
+        gcn_rows)
+    df2 = print_table(
+        "TABLE II -- LR:  SINGLE-SCALE vs MULTI-SCALE "
+        "(5 Scales: 83, 129, 234, 463, 1015)",
+        lr_rows)
+
+    # ── 4. Save CSVs ──────────────────────────────────────────────
+    df1.to_csv("table1_gcn_5scales.csv",      index=False)
+    df2.to_csv("table2_logistic_5scales.csv", index=False)
+    print("\nSaved: table1_gcn_5scales.csv  |  table2_logistic_5scales.csv")
+
+
+if __name__ == "__main__":
+    main()
